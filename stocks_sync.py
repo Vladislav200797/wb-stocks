@@ -20,13 +20,21 @@ def fetch_stocks(date_from):
     return resp.json()
 
 def normalize_row(r):
-    def parse_ts(s):
-        try:
-            return dt.datetime.fromisoformat(s.replace("Z",""))
-        except Exception:
+    # Вернём last_change_ts как ISO-строку, а не как datetime
+    def norm_ts(s: str | None):
+        if not s:
             return None
+        # WB иногда присылает с 'Z' и миллисекундами — срежем до секунд
+        try:
+            import datetime as dt
+            ts = dt.datetime.fromisoformat(s.replace("Z", ""))
+            return ts.replace(microsecond=0).isoformat()
+        except Exception:
+            # если вдруг формат неожиданный — отправим как есть (строкой)
+            return s
+
     return {
-        "last_change_ts": parse_ts(r.get("lastChangeDate")),
+        "last_change_ts": norm_ts(r.get("lastChangeDate")),
         "warehouse_name": r.get("warehouseName"),
         "supplier_article": r.get("supplierArticle"),
         "nm_id": r.get("nmId"),
@@ -41,7 +49,7 @@ def normalize_row(r):
         "discount": r.get("Discount"),
         "is_supply": r.get("isSupply"),
         "is_realization": r.get("isRealization"),
-        "sc_code": r.get("SCCode")
+        "sc_code": r.get("SCCode"),
     }
 
 def chunked(iterable, size):
