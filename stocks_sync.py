@@ -1,10 +1,9 @@
 # stocks_sync.py
 # Оперативные остатки WB через отчет Seller Analytics: warehouse_remains
-# Создаём задачу -> ждём done -> скачиваем -> upsert в wb_stocks_current.
+# Создаём задачу (GET) -> ждём done -> скачиваем (GET) -> upsert в wb_stocks_current.
 
 import os
 import time
-import datetime as dt
 from typing import Iterable, List, Dict, Any, Optional
 
 import requests
@@ -15,24 +14,24 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE"]  # service_role
 WB_API_KEY   = os.environ["WB_API_KEY"]
 
-# Базовые URL метода отчёта остатков (Seller Analytics)
+# Базовые URL отчёта «остатки на складах»
 SA_BASE = "https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains"
 
-# Параметры отчёта (можно переопределять через Secrets → Environment variables)
+# Параметры отчёта (переопределяй через env при необходимости)
 REPORT_LOCALE     = os.environ.get("REPORT_LOCALE", "ru")  # ru|en|zh
 GROUP_BY_BRAND    = os.environ.get("GROUP_BY_BRAND", "false").lower() == "true"
 GROUP_BY_SUBJECT  = os.environ.get("GROUP_BY_SUBJECT", "false").lower() == "true"
-GROUP_BY_SA       = os.environ.get("GROUP_BY_SA", "true").lower() == "true"   # vendorCode
-GROUP_BY_NM       = os.environ.get("GROUP_BY_NM", "true").lower() == "true"   # nmId
+GROUP_BY_SA       = os.environ.get("GROUP_BY_SA", "true").lower() == "true"    # vendorCode
+GROUP_BY_NM       = os.environ.get("GROUP_BY_NM", "true").lower() == "true"    # nmId
 GROUP_BY_BARCODE  = os.environ.get("GROUP_BY_BARCODE", "true").lower() == "true"
 GROUP_BY_SIZE     = os.environ.get("GROUP_BY_SIZE", "true").lower() == "true"
 
 # Тайминги опроса
-STATUS_POLL_SEC   = int(os.environ.get("STATUS_POLL_SEC", "3"))
-STATUS_TIMEOUT_SEC= int(os.environ.get("STATUS_TIMEOUT_SEC", "180"))  # 3 мин на генерацию
+STATUS_POLL_SEC    = int(os.environ.get("STATUS_POLL_SEC", "3"))
+STATUS_TIMEOUT_SEC = int(os.environ.get("STATUS_TIMEOUT_SEC", "180"))  # 3 мин на генерацию
 
-BATCH_SIZE        = int(os.environ.get("BATCH_SIZE", "1000"))
-MAX_RETRIES       = int(os.environ.get("MAX_RETRIES", "3"))           # ретраи HTTP на 429/5xx
+BATCH_SIZE   = int(os.environ.get("BATCH_SIZE", "1000"))
+MAX_RETRIES  = int(os.environ.get("MAX_RETRIES", "3"))                 # ретраи HTTP на 429/5xx
 
 
 def _auth_headers() -> Dict[str, str]:
@@ -61,8 +60,7 @@ def _retryable_request(method: str, url: str, **kwargs) -> requests.Response:
 
 def create_report_task() -> str:
     """
-    Создаём задачу отчёта.
-    По спецификации — query-параметры с группировками.
+    Создаём задачу отчёта (ИМЕННО GET!).
     Ответ: {"data":{"taskId":"..."}}
     """
     params = {
@@ -75,7 +73,7 @@ def create_report_task() -> str:
         "groupBySize": str(GROUP_BY_SIZE).lower(),
     }
     url = SA_BASE
-    resp = _retryable_request("POST", url, headers=_auth_headers(), params=params)
+    resp = _retryable_request("GET", url, headers=_auth_headers(), params=params)
     js = resp.json()
     task_id = js.get("data", {}).get("taskId")
     if not task_id:
@@ -87,7 +85,7 @@ def create_report_task() -> str:
 def wait_task_done(task_id: str) -> None:
     """
     Пуллим статус до 'done' (или 'failed') с таймаутом.
-    GET /api/v1/warehouse_remains/tasks/{task_id}/status -> {"data":{"id":"...","status":"done"}}
+    GET /api/v1/warehouse_remains/tasks/{task_id}/status
     """
     url = f"{SA_BASE}/tasks/{task_id}/status"
     deadline = time.time() + STATUS_TIMEOUT_SEC
@@ -109,17 +107,6 @@ def download_report(task_id: str) -> List[Dict[str, Any]]:
     """
     Скачиваем готовый отчёт.
     GET /api/v1/warehouse_remains/tasks/{task_id}/download
-    Пример элемента:
-      {
-        "brand": "...",
-        "subjectName": "...",
-        "vendorCode": "...",
-        "nmId": 123,
-        "barcode": "....",
-        "techSize": "0",
-        "volume": 1.33,
-        "warehouses": [{"warehouseName":"Koledino","quantity":42}, ...]
-      }
     """
     url = f"{SA_BASE}/tasks/{task_id}/download"
     resp = _retryable_request("GET", url, headers=_auth_headers())
@@ -133,7 +120,7 @@ def download_report(task_id: str) -> List[Dict[str, Any]]:
 def flatten_rows(report_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Разворачиваем массив warehouses в плоские строки по складам.
-    Поля, которых нет в отчёте (price/discount/category/subject/...) — заполним тем, что есть или None.
+    Пустые склады (quantity=0) WB не присылает — их пропускаем.
     """
     flat: List[Dict[str, Any]] = []
     for item in report_rows:
@@ -142,12 +129,9 @@ def flatten_rows(report_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         tech_size = item.get("techSize")
         brand = item.get("brand")
         supplier_article = item.get("vendorCode")
-        subject_name = item.get("subjectName")  # маппим в 'subject'
+        subject_name = item.get("subjectName")
         warehouses = item.get("warehouses") or []
 
-        # Если складов нет — значит quantity=0 везде -> в current-таблице строку можно не держать,
-        # либо держать как ноль по каждому складу (но тогда надо знать список всех складов).
-        # Логичнее пропустить пустые остатки.
         for wh in warehouses:
             flat.append({
                 "last_change_ts": None,                      # отчёт не отдаёт lastChange
@@ -156,17 +140,16 @@ def flatten_rows(report_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "nm_id": nm_id,
                 "barcode": barcode,
                 "quantity": wh.get("quantity"),
-                "quantity_full": None,                      # нет в отчёте
-                "category": None,                           # нет в отчёте
+                "quantity_full": None,
+                "category": None,
                 "subject": subject_name,
                 "brand": brand,
                 "tech_size": tech_size,
-                "price": None,                              # нет в отчёте
-                "discount": None,                           # нет в отчёте
-                "is_supply": None,                          # нет в отчёте
-                "is_realization": None,                     # нет в отчёте
-                "sc_code": None,                            # нет в отчёте
-                # updated_at проставит БД
+                "price": None,
+                "discount": None,
+                "is_supply": None,
+                "is_realization": None,
+                "sc_code": None,
             })
     print(f"Flattened rows: {len(flat)}")
     return flat
