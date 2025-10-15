@@ -1,40 +1,58 @@
 import os
+import time
+import math
 import datetime as dt
 import requests
-from supabase import create_client
+from typing import Iterable, List, Dict, Any
+from supabase import create_client, Client
+from postgrest.exceptions import APIError
 
 WB_API_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/stocks"
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE"]
-WB_API_KEY = os.environ["WB_API_KEY"]
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE"]  # service_role key
+WB_API_KEY    = os.environ["WB_API_KEY"]
 
-def rfc3339(dtobj):
-    return dtobj.strftime("%Y-%m-%dT%H:%M:%S")
+# Параметры
+LOOKBACK_MINUTES = int(os.environ.get("LOOKBACK_MINUTES", "31"))  # перекрытие CRON 30 мин
+BATCH_SIZE       = int(os.environ.get("BATCH_SIZE", "1000"))
+MAX_RETRIES      = int(os.environ.get("MAX_RETRIES", "3"))
 
-def fetch_stocks(date_from):
+def rfc3339(dtobj: dt.datetime) -> str:
+    # WB принимает "YYYY-MM-DDTHH:MM:SS"
+    return dtobj.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+
+def fetch_stocks(date_from_str: str) -> List[Dict[str, Any]]:
     headers = {"Authorization": WB_API_KEY}
-    params = {"dateFrom": date_from}
-    resp = requests.get(WB_API_URL, headers=headers, params=params, timeout=120)
-    resp.raise_for_status()
-    return resp.json()
+    params  = {"dateFrom": date_from_str}
 
-def normalize_row(r):
-    # Вернём last_change_ts как ISO-строку, а не как datetime
-    def norm_ts(s: str | None):
-        if not s:
-            return None
-        # WB иногда присылает с 'Z' и миллисекундами — срежем до секунд
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            import datetime as dt
-            ts = dt.datetime.fromisoformat(s.replace("Z", ""))
-            return ts.replace(microsecond=0).isoformat()
-        except Exception:
-            # если вдруг формат неожиданный — отправим как есть (строкой)
-            return s
+            resp = requests.get(WB_API_URL, headers=headers, params=params, timeout=120)
+            # 429/5xx — бэкоф
+            if resp.status_code in (429, 500, 502, 503, 504):
+                delay = min(30, 2 ** attempt)
+                print(f"WB API {resp.status_code}, retry in {delay}s (attempt {attempt}/{MAX_RETRIES})")
+                time.sleep(delay)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, list):
+                raise ValueError(f"Unexpected WB response type: {type(data)}")
+            return data
+        except requests.RequestException as e:
+            delay = min(30, 2 ** attempt)
+            print(f"WB API error: {e}, retry in {delay}s (attempt {attempt}/{MAX_RETRIES})")
+            time.sleep(delay)
 
+    raise SystemExit("WB API: all retries failed")
+
+def normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    # ВАЖНО: last_change_ts отправляем СТРОКОЙ (или None) — PostgREST сам приведёт к timestamptz
+    # Оставим строку из WB как есть, но если там есть 'Z' или миллисекунды — это ок для PG.
+    last_change = r.get("lastChangeDate")
     return {
-        "last_change_ts": norm_ts(r.get("lastChangeDate")),
+        "last_change_ts": last_change,  # строка, не datetime!
         "warehouse_name": r.get("warehouseName"),
         "supplier_article": r.get("supplierArticle"),
         "nm_id": r.get("nmId"),
@@ -50,9 +68,10 @@ def normalize_row(r):
         "is_supply": r.get("isSupply"),
         "is_realization": r.get("isRealization"),
         "sc_code": r.get("SCCode"),
+        # updated_at заполняется дефолтом в БД
     }
 
-def chunked(iterable, size):
+def chunked(iterable: Iterable[Any], size: int) -> Iterable[List[Any]]:
     buf = []
     for x in iterable:
         buf.append(x)
@@ -62,26 +81,52 @@ def chunked(iterable, size):
     if buf:
         yield buf
 
-def main():
-    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-    date_from = rfc3339(dt.datetime.utcnow() - dt.timedelta(minutes=31))
-    data = fetch_stocks(date_from)
-    if not isinstance(data, list) or not data:
-        print("No data returned")
+def upsert_current(sb: Client, rows: List[Dict[str, Any]]) -> None:
+    total = len(rows)
+    if total == 0:
+        print("No rows to upsert")
         return
 
-    rows = [normalize_row(r) for r in data]
-
-    for batch in chunked(rows, 1000):
+    sent = 0
+    for batch in chunked(rows, BATCH_SIZE):
         res = sb.table("wb_stocks_current") \
-            .upsert(batch, on_conflict="nm_id,barcode,warehouse_name") \
-            .execute()
-        if res.get("status_code") not in (None, 200, 201):
-            print("Upsert error:", res)
-            return
+                .upsert(batch, on_conflict="nm_id,barcode,warehouse_name") \
+                .execute()
 
-    print(f"Updated {len(rows)} records in wb_stocks_current")
+        # APIResponse: проверяем error, data
+        if getattr(res, "error", None):
+            msg = getattr(res.error, "message", str(res.error))
+            raise SystemExit(f"Upsert error: {msg}")
+
+        # data может быть None (если return=minimal настроен на стороне PostgREST)
+        affected = len(res.data) if res.data is not None else 0
+        sent += len(batch)
+        print(f"Upserted batch {len(batch)} (affected≈{affected}), progress {sent}/{total}")
+
+def main():
+    sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    # Берём LOOKBACK минут назад, чтобы захватить все изменения
+    date_from = rfc3339(dt.datetime.utcnow() - dt.timedelta(minutes=LOOKBACK_MINUTES))
+    print(f"Requesting WB stocks since {date_from} (UTC)")
+
+    raw = fetch_stocks(date_from)
+    rows = [normalize_row(r) for r in raw]
+
+    # Фильтруем пустые nm_id/barcode/warehouse_name — они обязательны для PK
+    cleaned = [
+        x for x in rows
+        if x.get("nm_id") is not None
+        and x.get("barcode")
+        and x.get("warehouse_name")
+    ]
+
+    dropped = len(rows) - len(cleaned)
+    if dropped:
+        print(f"Dropped {dropped} rows without required keys (nm_id/barcode/warehouse_name)")
+
+    upsert_current(sb, cleaned)
+    print(f"Done. Total processed: {len(cleaned)}")
 
 if __name__ == "__main__":
     main()
