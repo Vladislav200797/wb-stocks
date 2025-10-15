@@ -1,92 +1,179 @@
 # stocks_sync.py
-# Загрузка оперативных остатков WB в одну таблицу Supabase (upsert).
-# Поддерживает FULL_SYNC=1 для первой полной загрузки.
+# Оперативные остатки WB через отчет Seller Analytics: warehouse_remains
+# Создаём задачу -> ждём done -> скачиваем -> upsert в wb_stocks_current.
 
 import os
 import time
 import datetime as dt
-from typing import Iterable, List, Dict, Any
+from typing import Iterable, List, Dict, Any, Optional
 
 import requests
 from supabase import create_client, Client
 
-WB_API_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/stocks"
-
-# --- Обязательные переменные окружения ---
+# --- ENV ---
 SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE"]  # service_role key
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE"]  # service_role
 WB_API_KEY   = os.environ["WB_API_KEY"]
 
-# --- Настройки по умолчанию (можно переопределить через env) ---
-LOOKBACK_MINUTES = int(os.environ.get("LOOKBACK_MINUTES", "31"))  # перекрытие 30-минутного интервала
-BATCH_SIZE       = int(os.environ.get("BATCH_SIZE", "1000"))
-MAX_RETRIES      = int(os.environ.get("MAX_RETRIES", "3"))
-FULL_SYNC        = os.environ.get("FULL_SYNC", "0") == "1"         # один раз запустить с 1 для полной загрузки
+# Базовые URL метода отчёта остатков (Seller Analytics)
+SA_BASE = "https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains"
+
+# Параметры отчёта (можно переопределять через Secrets → Environment variables)
+REPORT_LOCALE     = os.environ.get("REPORT_LOCALE", "ru")  # ru|en|zh
+GROUP_BY_BRAND    = os.environ.get("GROUP_BY_BRAND", "false").lower() == "true"
+GROUP_BY_SUBJECT  = os.environ.get("GROUP_BY_SUBJECT", "false").lower() == "true"
+GROUP_BY_SA       = os.environ.get("GROUP_BY_SA", "true").lower() == "true"   # vendorCode
+GROUP_BY_NM       = os.environ.get("GROUP_BY_NM", "true").lower() == "true"   # nmId
+GROUP_BY_BARCODE  = os.environ.get("GROUP_BY_BARCODE", "true").lower() == "true"
+GROUP_BY_SIZE     = os.environ.get("GROUP_BY_SIZE", "true").lower() == "true"
+
+# Тайминги опроса
+STATUS_POLL_SEC   = int(os.environ.get("STATUS_POLL_SEC", "3"))
+STATUS_TIMEOUT_SEC= int(os.environ.get("STATUS_TIMEOUT_SEC", "180"))  # 3 мин на генерацию
+
+BATCH_SIZE        = int(os.environ.get("BATCH_SIZE", "1000"))
+MAX_RETRIES       = int(os.environ.get("MAX_RETRIES", "3"))           # ретраи HTTP на 429/5xx
 
 
-def rfc3339(dtobj: dt.datetime) -> str:
-    """WB принимает строку формата YYYY-MM-DDTHH:MM:SS (RFC3339 без миллисекунд)."""
-    return dtobj.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+def _auth_headers() -> Dict[str, str]:
+    return {"Authorization": WB_API_KEY}
 
 
-def fetch_stocks(date_from_str: str) -> List[Dict[str, Any]]:
-    """Тянем остатки из WB с ретраями на 429/5xx."""
-    headers = {"Authorization": WB_API_KEY}
-    params = {"dateFrom": date_from_str}
-
-    last_err = None
+def _retryable_request(method: str, url: str, **kwargs) -> requests.Response:
+    last_err: Optional[Exception] = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = requests.get(WB_API_URL, headers=headers, params=params, timeout=120)
+            resp = requests.request(method, url, timeout=120, **kwargs)
             if resp.status_code in (429, 500, 502, 503, 504):
                 delay = min(30, 2 ** attempt)
-                print(f"WB API {resp.status_code}, retry in {delay}s (attempt {attempt}/{MAX_RETRIES})")
+                print(f"{method} {url} -> {resp.status_code}, retry in {delay}s (attempt {attempt}/{MAX_RETRIES})")
                 time.sleep(delay)
                 continue
-
             resp.raise_for_status()
-            data = resp.json()
-            if not isinstance(data, list):
-                raise ValueError(f"Unexpected WB response type: {type(data)}")
-            return data
-
+            return resp
         except Exception as e:
             last_err = e
             delay = min(30, 2 ** attempt)
-            print(f"WB API error: {e!r}, retry in {delay}s (attempt {attempt}/{MAX_RETRIES})")
+            print(f"{method} {url} error: {e!r}, retry in {delay}s (attempt {attempt}/{MAX_RETRIES})")
             time.sleep(delay)
+    raise SystemExit(f"HTTP failed after retries: {method} {url} last_err={last_err!r}")
 
-    raise SystemExit(f"WB API: all retries failed. Last error: {last_err!r}")
 
-
-def normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
+def create_report_task() -> str:
     """
-    Нормализуем поля под таблицу wb_stocks_current.
-    last_change_ts оставляем строкой (PostgREST приведёт к timestamptz).
+    Создаём задачу отчёта.
+    По спецификации — query-параметры с группировками.
+    Ответ: {"data":{"taskId":"..."}}
     """
-    return {
-        "last_change_ts": r.get("lastChangeDate"),
-        "warehouse_name": r.get("warehouseName"),
-        "supplier_article": r.get("supplierArticle"),
-        "nm_id": r.get("nmId"),
-        "barcode": r.get("barcode"),
-        "quantity": r.get("quantity"),
-        "quantity_full": r.get("quantityFull"),
-        "category": r.get("category"),
-        "subject": r.get("subject"),
-        "brand": r.get("brand"),
-        "tech_size": r.get("techSize"),
-        "price": r.get("Price"),
-        "discount": r.get("Discount"),
-        "is_supply": r.get("isSupply"),
-        "is_realization": r.get("isRealization"),
-        "sc_code": r.get("SCCode"),
-        # updated_at заполнится дефолтом в БД
+    params = {
+        "locale": REPORT_LOCALE,
+        "groupByBrand": str(GROUP_BY_BRAND).lower(),
+        "groupBySubject": str(GROUP_BY_SUBJECT).lower(),
+        "groupBySa": str(GROUP_BY_SA).lower(),
+        "groupByNm": str(GROUP_BY_NM).lower(),
+        "groupByBarcode": str(GROUP_BY_BARCODE).lower(),
+        "groupBySize": str(GROUP_BY_SIZE).lower(),
     }
+    url = SA_BASE
+    resp = _retryable_request("POST", url, headers=_auth_headers(), params=params)
+    js = resp.json()
+    task_id = js.get("data", {}).get("taskId")
+    if not task_id:
+        raise SystemExit(f"Unexpected create_task response: {js}")
+    print(f"Report task created: {task_id}")
+    return task_id
 
 
-def chunked(iterable: Iterable[Any], size: int) -> Iterable[List[Any]]:
-    buf: List[Any] = []
+def wait_task_done(task_id: str) -> None:
+    """
+    Пуллим статус до 'done' (или 'failed') с таймаутом.
+    GET /api/v1/warehouse_remains/tasks/{task_id}/status -> {"data":{"id":"...","status":"done"}}
+    """
+    url = f"{SA_BASE}/tasks/{task_id}/status"
+    deadline = time.time() + STATUS_TIMEOUT_SEC
+    while True:
+        resp = _retryable_request("GET", url, headers=_auth_headers())
+        js = resp.json()
+        status = js.get("data", {}).get("status")
+        print(f"task {task_id} status: {status}")
+        if status == "done":
+            return
+        if status == "failed":
+            raise SystemExit(f"Report task {task_id} failed")
+        if time.time() > deadline:
+            raise SystemExit(f"Report task {task_id} timeout after {STATUS_TIMEOUT_SEC}s")
+        time.sleep(STATUS_POLL_SEC)
+
+
+def download_report(task_id: str) -> List[Dict[str, Any]]:
+    """
+    Скачиваем готовый отчёт.
+    GET /api/v1/warehouse_remains/tasks/{task_id}/download
+    Пример элемента:
+      {
+        "brand": "...",
+        "subjectName": "...",
+        "vendorCode": "...",
+        "nmId": 123,
+        "barcode": "....",
+        "techSize": "0",
+        "volume": 1.33,
+        "warehouses": [{"warehouseName":"Koledino","quantity":42}, ...]
+      }
+    """
+    url = f"{SA_BASE}/tasks/{task_id}/download"
+    resp = _retryable_request("GET", url, headers=_auth_headers())
+    data = resp.json()
+    if not isinstance(data, list):
+        raise SystemExit(f"Unexpected download payload: {type(data)}")
+    print(f"Report rows: {len(data)}")
+    return data
+
+
+def flatten_rows(report_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Разворачиваем массив warehouses в плоские строки по складам.
+    Поля, которых нет в отчёте (price/discount/category/subject/...) — заполним тем, что есть или None.
+    """
+    flat: List[Dict[str, Any]] = []
+    for item in report_rows:
+        nm_id = item.get("nmId")
+        barcode = item.get("barcode")
+        tech_size = item.get("techSize")
+        brand = item.get("brand")
+        supplier_article = item.get("vendorCode")
+        subject_name = item.get("subjectName")  # маппим в 'subject'
+        warehouses = item.get("warehouses") or []
+
+        # Если складов нет — значит quantity=0 везде -> в current-таблице строку можно не держать,
+        # либо держать как ноль по каждому складу (но тогда надо знать список всех складов).
+        # Логичнее пропустить пустые остатки.
+        for wh in warehouses:
+            flat.append({
+                "last_change_ts": None,                      # отчёт не отдаёт lastChange
+                "warehouse_name": wh.get("warehouseName"),
+                "supplier_article": supplier_article,
+                "nm_id": nm_id,
+                "barcode": barcode,
+                "quantity": wh.get("quantity"),
+                "quantity_full": None,                      # нет в отчёте
+                "category": None,                           # нет в отчёте
+                "subject": subject_name,
+                "brand": brand,
+                "tech_size": tech_size,
+                "price": None,                              # нет в отчёте
+                "discount": None,                           # нет в отчёте
+                "is_supply": None,                          # нет в отчёте
+                "is_realization": None,                     # нет в отчёте
+                "sc_code": None,                            # нет в отчёте
+                # updated_at проставит БД
+            })
+    print(f"Flattened rows: {len(flat)}")
+    return flat
+
+
+def chunked(iterable, size):
+    buf = []
     for x in iterable:
         buf.append(x)
         if len(buf) == size:
@@ -97,9 +184,7 @@ def chunked(iterable: Iterable[Any], size: int) -> Iterable[List[Any]]:
 
 
 def upsert_current(sb: Client, rows: List[Dict[str, Any]]) -> None:
-    """Апсертим в wb_stocks_current батчами. Проверяем APIResponse.error."""
-    total = len(rows)
-    if total == 0:
+    if not rows:
         print("No rows to upsert")
         return
 
@@ -108,61 +193,33 @@ def upsert_current(sb: Client, rows: List[Dict[str, Any]]) -> None:
         res = sb.table("wb_stocks_current") \
                 .upsert(batch, on_conflict="nm_id,barcode,warehouse_name") \
                 .execute()
-
-        # В supabase-py v2 возвращается APIResponse с полями .data / .error
         if getattr(res, "error", None):
             msg = getattr(res.error, "message", str(res.error))
             raise SystemExit(f"Upsert error: {msg}")
-
         affected = len(res.data) if res.data is not None else 0
         sent += len(batch)
-        print(f"Upserted batch {len(batch)} (affected≈{affected}), progress {sent}/{total}")
+        print(f"Upserted batch {len(batch)} (affected≈{affected}), progress {sent}/{len(rows)}")
 
 
-def main() -> None:
+def main():
+    print("Creating report task…")
+    task_id = create_report_task()
+    print("Waiting for report to be ready…")
+    wait_task_done(task_id)
+    print("Downloading report…")
+    report = download_report(task_id)
+    rows = flatten_rows(report)
+
+    # Фильтруем обязательные ключи PK
+    cleaned = [
+        x for x in rows
+        if x.get("nm_id") is not None and x.get("barcode") and x.get("warehouse_name")
+    ]
+    if len(cleaned) != len(rows):
+        print(f"Dropped {len(rows) - len(cleaned)} rows without nm_id/barcode/warehouse_name")
+
+    # Апсерт
     sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-    if FULL_SYNC:
-        # Самая ранняя дата, чтобы WB вернул все актуальные позиции
-        date_from = "2019-06-20T00:00:00"
-        print(f"FULL_SYNC=1 -> requesting COMPLETE stocks since {date_from}")
-    else:
-        date_from = rfc3339(dt.datetime.utcnow() - dt.timedelta(minutes=LOOKBACK_MINUTES))
-        print(f"Incremental -> requesting since {date_from} (UTC)")
-
-    raw = fetch_stocks(date_from)
-    print(f"WB returned {len(raw)} rows")
-
-    rows = [normalize_row(r) for r in raw]
-
-    # Фильтруем строки без обязательных полей для PK
-    cleaned: List[Dict[str, Any]] = []
-    dropped_missing = 0
-    missing_nm = 0
-    missing_bc = 0
-    missing_wh = 0
-
-    for x in rows:
-        ok_nm = x.get("nm_id") is not None
-        ok_bc = bool(x.get("barcode"))
-        ok_wh = bool(x.get("warehouse_name"))
-        if ok_nm and ok_bc and ok_wh:
-            cleaned.append(x)
-        else:
-            dropped_missing += 1
-            if not ok_nm:
-                missing_nm += 1
-            if not ok_bc:
-                missing_bc += 1
-            if not ok_wh:
-                missing_wh += 1
-
-    if dropped_missing:
-        print(
-            f"Dropped {dropped_missing} rows missing PK fields "
-            f"(nm_id missing: {missing_nm}, barcode missing: {missing_bc}, warehouse_name missing: {missing_wh})"
-        )
-
     upsert_current(sb, cleaned)
     print(f"Done. Total processed: {len(cleaned)}")
 
