@@ -2,20 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-Синхронизация остатков WB в Supabase через отчёт Seller Analytics:
-- Создаём задачу /api/v1/warehouse_remains
-- Ждём статуса "done"
-- Скачиваем отчёт
-- Плющим по складам + добавляем агрегат "Всего находится на складах"
-- Апсертим батчами в таблицу stocks_current
+WB stocks -> Supabase (как в твоём GAS-скрипте):
+- Берём статистику остатков: GET /api/v1/supplier/stocks
+- Пишем поминутно по складам
+- Отдельно добавляем агрегат "Всего находится на складах" (без складов "В пути …")
+- (опционально) подтягиваем скидки через Discounts API
 
 ENV (GitHub Actions -> Secrets):
   SUPABASE_URL
   SUPABASE_SERVICE_ROLE
-  WB_API_KEY              # токен категории "Аналитика продавца" (без Bearer!)
+
+  # Тот же токен, что в Google-таблице в "Технический!B1"
+  # Для статистики он идёт без "Bearer"
+  WB_STATS_API_KEY
+
+  # Для Discounts API нужен Bearer-токен (если такой же — просто скопируй)
+  WB_DISCOUNTS_BEARER   (опционально)
+
 Опционально:
-  TABLE_NAME   (default: stocks_current)
-  BATCH_SIZE   (default: 1000)
+  TABLE_NAME (default: stocks_current)
+  BATCH_SIZE (default: 1000)
+  WITH_DISCOUNTS (default: false)   # "true" чтобы дергать discounts API
 """
 
 from __future__ import annotations
@@ -23,37 +30,24 @@ import os
 import sys
 import time
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from requests import Response
 from supabase import create_client, Client
 
-# --------------------
-# Конфиг
-# --------------------
+# -------------------- Конфиг --------------------
 
-SELLER_ANALYTICS_BASE = "https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains"
+STATS_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/stocks"
+DATE_FROM = "2021-01-01T00:00:00Z"
+
+DISCOUNTS_URL = "https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter"
+DISCOUNTS_LIMIT = 1000
 
 TABLE_NAME = os.getenv("TABLE_NAME", "stocks_current")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
+WITH_DISCOUNTS = os.getenv("WITH_DISCOUNTS", "false").lower() == "true"
 
-REPORT_PARAMS_BOOL = {
-    "groupByBrand": False,
-    "groupBySubject": False,
-    "groupBySa": True,
-    "groupByNm": True,
-    "groupByBarcode": True,
-    "groupBySize": True,
-}
-REPORT_LOCALE = "ru"
-
-POLL_INTERVAL_SEC = 2
-POLL_TIMEOUT_SEC = 180
-
-# --------------------
-# Утилиты
-# --------------------
+# -------------------- Утилиты --------------------
 
 def env_required(name: str) -> str:
     val = os.getenv(name)
@@ -62,288 +56,19 @@ def env_required(name: str) -> str:
         sys.exit(2)
     return val
 
-def _encode_bool_params(params: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for k, v in params.items():
-        if isinstance(v, bool):
-            out[k] = "true" if v else "false"
-        else:
-            out[k] = v
-    return out
-
-def http_request(
-    method: str,
-    url: str,
-    headers: Optional[Dict[str, str]] = None,
-    params: Optional[Dict[str, Any]] = None,
-    json_body: Optional[Dict[str, Any]] = None,
-    timeout: int = 60,
-    retries: int = 1,
-) -> Response:
-    last_exc: Optional[Exception] = None
-    for attempt in range(1, retries + 1):
+def http_get_json(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]] = None, retry: int = 2) -> Any:
+    last = None
+    for i in range(retry):
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+        if resp.status_code >= 400:
+            print(f"GET {url} -> {resp.status_code}; body~ {resp.text[:300]}")
         try:
-            resp = requests.request(
-                method=method,
-                url=url,
-                headers=headers or {},
-                params=params,
-                json=json_body,
-                timeout=timeout,
-            )
-            if resp.status_code >= 400:
-                snippet = resp.text[:300].replace("\n", " ")
-                print(f"{method} {url} -> {resp.status_code}; body~: {snippet}")
             resp.raise_for_status()
-            return resp
-        except requests.HTTPError as e:
-            last_exc = e
-            if attempt < retries:
-                time.sleep(1.5)
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("http_request failed without exception?")
-
-# --------------------
-# WB Seller Analytics: создание/ожидание/скачивание
-# --------------------
-
-def create_report_task(wb_api_key: str) -> str:
-    """
-    Порядок стратегий (учитывая ваш лог Allow: GET, HEAD):
-      G1: GET + query
-      P2: POST + query + пустое json {}
-      P3: POST + body с флагами (top-level)
-      P4: POST + body с groupBy объектом
-    """
-    base_headers = {
-        "Authorization": wb_api_key,        # без "Bearer"
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-
-    # ------- G1: GET + query (рекомендуемый WB согласно Allow) -------
-    params_q = {"locale": REPORT_LOCALE, **REPORT_PARAMS_BOOL}
-    params_q = _encode_bool_params(params_q)
-    print("Creating report task (G1: GET + query)…")
-    try:
-        resp = http_request(
-            "GET",
-            SELLER_ANALYTICS_BASE,
-            headers=base_headers,
-            params=params_q,
-            retries=1,
-        )
-        data = resp.json()
-        tid = (data.get("data") or {}).get("taskId")
-        if tid:
-            print(f"Report task created (G1): {tid}")
-            return tid
-        else:
-            print(f"G1 returned no taskId, response: {data}")
-    except Exception as e:
-        print(f"G1 failed: {repr(e)}")
-
-    # ------- P2: POST + query + пустое тело -------
-    print("Creating report task (P2: POST + query + empty body)…")
-    try:
-        resp = http_request(
-            "POST",
-            SELLER_ANALYTICS_BASE,
-            headers=base_headers,
-            params=params_q,
-            json_body={},
-            retries=1,
-        )
-        data = resp.json()
-        tid = (data.get("data") or {}).get("taskId")
-        if tid:
-            print(f"Report task created (P2): {tid}")
-            return tid
-        else:
-            print(f"P2 returned no taskId, response: {data}")
-    except Exception as e:
-        print(f"P2 failed: {repr(e)}")
-
-    # ------- P3: POST + body (top-level flags) -------
-    body_top = {"locale": REPORT_LOCALE}
-    body_top.update(REPORT_PARAMS_BOOL)
-    print("Creating report task (P3: POST body top-level)…")
-    try:
-        resp = http_request(
-            "POST",
-            SELLER_ANALYTICS_BASE,
-            headers=base_headers,
-            json_body=body_top,
-            retries=1,
-        )
-        data = resp.json()
-        tid = (data.get("data") or {}).get("taskId")
-        if tid:
-            print(f"Report task created (P3): {tid}")
-            return tid
-        else:
-            print(f"P3 returned no taskId, response: {data}")
-    except Exception as e:
-        print(f"P3 failed: {repr(e)}")
-
-    # ------- P4: POST + body (groupBy object) -------
-    body_group = {
-        "locale": REPORT_LOCALE,
-        "groupBy": {
-            "brand": REPORT_PARAMS_BOOL["groupByBrand"],
-            "subject": REPORT_PARAMS_BOOL["groupBySubject"],
-            "sa": REPORT_PARAMS_BOOL["groupBySa"],
-            "nm": REPORT_PARAMS_BOOL["groupByNm"],
-            "barcode": REPORT_PARAMS_BOOL["groupByBarcode"],
-            "size": REPORT_PARAMS_BOOL["groupBySize"],
-        }
-    }
-    print("Creating report task (P4: POST body groupBy)…")
-    try:
-        resp = http_request(
-            "POST",
-            SELLER_ANALYTICS_BASE,
-            headers=base_headers,
-            json_body=body_group,
-            retries=1,
-        )
-        data = resp.json()
-        tid = (data.get("data") or {}).get("taskId")
-        if tid:
-            print(f"Report task created (P4): {tid}")
-            return tid
-        else:
-            print(f"P4 returned no taskId, response: {data}")
-    except Exception as e:
-        print(f"P4 failed: {repr(e)}")
-
-    raise RuntimeError("Failed to create report task via all strategies (G1/P2/P3/P4).")
-
-def wait_report_ready(wb_api_key: str, task_id: str) -> None:
-    headers = {"Authorization": wb_api_key, "Accept": "application/json"}
-    status_url = f"{SELLER_ANALYTICS_BASE}/tasks/{task_id}/status"
-
-    print("Waiting for report to be ready…")
-    started = time.time()
-    while True:
-        resp = http_request("GET", status_url, headers=headers)
-        data = resp.json()
-        status = (data.get("data") or {}).get("status")
-        print(f"task {task_id} status: {status}")
-        if status == "done":
-            return
-        if status in ("fail", "failed", "error"):
-            raise RuntimeError(f"WB report task failed: {data}")
-        if time.time() - started > POLL_TIMEOUT_SEC:
-            raise TimeoutError("Timed out waiting for report to be ready")
-        time.sleep(POLL_INTERVAL_SEC)
-
-def download_report(wb_api_key: str, task_id: str) -> List[Dict[str, Any]]:
-    headers = {"Authorization": wb_api_key, "Accept": "application/json"}
-    download_url = f"{SELLER_ANALYTICS_BASE}/tasks/{task_id}/download"
-    print("Downloading report…")
-    resp = http_request("GET", download_url, headers=headers)
-    try:
-        data = resp.json()
-    except json.JSONDecodeError:
-        raise RuntimeError(f"WB download returned non-json: {resp.text[:500]}")
-    if not isinstance(data, list):
-        raise RuntimeError(f"WB download: unexpected response shape: {type(data)}")
-    print(f"Report rows: {len(data)}")
-    return data
-
-# --------------------
-# Трансформация отчёта -> строки БД
-# --------------------
-
-def flatten_rows(report_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    flat: List[Dict[str, Any]] = []
-    now_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    for row in report_rows:
-        brand = row.get("brand")
-        subject_name = row.get("subjectName")
-        vendor_code = row.get("vendorCode")
-        nm_id = row.get("nmId")
-        barcode = row.get("barcode")
-        tech_size = row.get("techSize")
-        volume = row.get("volume")
-        warehouses = row.get("warehouses") or []
-
-        qty_sum = 0
-        in_way_to_sum = 0
-        in_way_from_sum = 0
-        qty_full_sum = 0
-
-        for w in warehouses:
-            warehouse_id = w.get("warehouseId")
-            warehouse_name = (w.get("warehouseName") or "").strip()
-
-            quantity = int(w.get("quantity") or 0)
-            in_way_to = int(w.get("inWayToClient") or 0)
-            in_way_from = int(w.get("inWayFromClient") or 0)
-
-            q_full = w.get("quantityFull")
-            if q_full is None:
-                q_full = quantity + in_way_to + in_way_from
-            q_full = int(q_full or 0)
-
-            # исключаем "В пути…" из агрегата
-            if not warehouse_name.startswith("В пути"):
-                qty_sum += quantity
-                in_way_to_sum += in_way_to
-                in_way_from_sum += in_way_from
-                qty_full_sum += q_full
-
-            flat.append(
-                {
-                    "nm_id": nm_id,
-                    "supplier_article": vendor_code,
-                    "barcode": barcode,
-                    "tech_size": tech_size,
-                    "brand": brand,
-                    "subject_name": subject_name,
-                    "volume_l": volume,
-                    "warehouse_id": warehouse_id,
-                    "warehouse_name": warehouse_name,
-                    "quantity": quantity,
-                    "in_way_to_client": in_way_to,
-                    "in_way_from_client": in_way_from,
-                    "quantity_full": q_full,
-                    "source": "seller_analytics_warehouse_remains",
-                    "locale": REPORT_LOCALE,
-                    "updated_utc": now_utc,
-                }
-            )
-
-        flat.append(
-            {
-                "nm_id": nm_id,
-                "supplier_article": vendor_code,
-                "barcode": barcode,
-                "tech_size": tech_size,
-                "brand": brand,
-                "subject_name": subject_name,
-                "volume_l": volume,
-                "warehouse_id": None,
-                "warehouse_name": "Всего находится на складах",
-                "quantity": qty_sum,
-                "in_way_to_client": in_way_to_sum,
-                "in_way_from_client": in_way_from_sum,
-                "quantity_full": qty_full_sum if qty_full_sum else (qty_sum + in_way_to_sum + in_way_from_sum),
-                "source": "seller_analytics_warehouse_remains",
-                "locale": REPORT_LOCALE,
-                "updated_utc": now_utc,
-            }
-        )
-
-    print(f"Flattened rows: {len(flat)}")
-    return flat
-
-# --------------------
-# Supabase
-# --------------------
+            return resp.json()
+        except Exception as e:
+            last = e
+            time.sleep(1.5)
+    raise last or RuntimeError("http_get_json failed")
 
 def supabase_client() -> Client:
     url = env_required("SUPABASE_URL")
@@ -363,29 +88,188 @@ def upsert_batches(sb: Client, table: str, rows: List[Dict[str, Any]], batch_siz
             on_conflict="nm_id,barcode,tech_size,warehouse_name",
         ).execute()
         affected = getattr(res, "count", None) or len(chunk)
-        print(f"Upserted batch {len(chunk)} (affected≈{affected}), progress {min(i+batch_size, total)}/{total}")
+        print(f"Upserted {len(chunk)} (≈{affected}) | {min(i+batch_size, total)}/{total}")
 
-# --------------------
-# main
-# --------------------
+# -------------------- Discounts (опционально) --------------------
+
+def fetch_discounts_map(bearer: str) -> Dict[int, float]:
+    """
+    Возвращает {nmID: discount_float_0..1}
+    """
+    headers = {"Authorization": f"Bearer {bearer}"}
+    offset = 0
+    result: Dict[int, float] = {}
+
+    while True:
+        params = {"limit": DISCOUNTS_LIMIT, "offset": offset}
+        data = http_get_json(DISCOUNTS_URL, headers=headers, params=params)
+        lst = (((data or {}).get("data") or {}).get("listGoods")) or []
+        if not lst:
+            break
+        for it in lst:
+            nm = it.get("nmID")
+            disc = it.get("discount")
+            if nm is not None and disc is not None:
+                try:
+                    result[int(nm)] = float(disc) / 100.0
+                except Exception:
+                    pass
+        if len(lst) < DISCOUNTS_LIMIT:
+            break
+        offset += DISCOUNTS_LIMIT
+        time.sleep(0.4)  # чутка притормозим
+    print(f"Discounts loaded: {len(result)} nmIDs")
+    return result
+
+# -------------------- Основная логика --------------------
+
+def fetch_stocks(stats_api_key: str) -> List[Dict[str, Any]]:
+    headers = {"Authorization": stats_api_key}
+    params = {"dateFrom": DATE_FROM}
+    data = http_get_json(STATS_URL, headers=headers, params=params)
+    if not isinstance(data, list):
+        raise RuntimeError(f"Unexpected stocks payload type: {type(data)}")
+    print(f"Stocks rows (raw): {len(data)}")
+    return data
+
+def split_rows_and_aggregate(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Из плоских строк делаем:
+      — такие же строки по складам
+      — + агрегат «Всего находится на складах» (сумма без «В пути …»)
+    """
+    out: List[Dict[str, Any]] = []
+    now_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    # ключ агрегата: (nmId, barcode, techSize)
+    sums: Dict[Tuple[int, str, str], Dict[str, int]] = {}
+
+    def add_to_sum(key: Tuple[int, str, str], q: int, to_cli: int, from_cli: int, q_full: Optional[int]):
+        agg = sums.setdefault(key, {"q": 0, "to": 0, "from": 0, "full": 0})
+        agg["q"] += q
+        agg["to"] += to_cli
+        agg["from"] += from_cli
+        if q_full is not None:
+            agg["full"] += q_full
+        else:
+            agg["full"] += (q + to_cli + from_cli)
+
+    for it in raw:
+        # поля ровно как в твоём GAS
+        lastChangeDate = it.get("lastChangeDate")
+        warehouseName = (it.get("warehouseName") or "").strip()
+        supplierArticle = it.get("supplierArticle")
+        nmId = it.get("nmId")
+        barcode = it.get("barcode")
+        quantity = int(it.get("quantity") or 0)
+        inWayToClient = int(it.get("inWayToClient") or 0)
+        inWayFromClient = int(it.get("inWayFromClient") or 0)
+        quantityFull = it.get("quantityFull")
+        if quantityFull is None:
+            quantityFull = quantity + inWayToClient + inWayFromClient
+        quantityFull = int(quantityFull or 0)
+
+        category = it.get("category")
+        subject = it.get("subject")
+        brand = it.get("brand")
+        techSize = it.get("techSize")
+        price = it.get("Price")
+        discount_field = it.get("Discount")
+
+        row = {
+            "updated_utc": now_utc,
+            "last_change_date": lastChangeDate,
+
+            "warehouse_name": warehouseName,
+            "supplier_article": supplierArticle,
+            "nm_id": nmId,
+            "barcode": barcode,
+
+            "quantity": quantity,
+            "in_way_to_client": inWayToClient,
+            "in_way_from_client": inWayFromClient,
+            "quantity_full": quantityFull,
+
+            "category": category,
+            "subject_name": subject,
+            "brand": brand,
+            "tech_size": techSize,
+
+            "price": price,
+            "discount_api": discount_field,   # как пришло из stocks (если есть)
+            "source": "statistics_api_v1",
+        }
+        out.append(row)
+
+        # суммируем для агрегата (но исключаем «В пути …»)
+        if not warehouseName.startswith("В пути"):
+            key = (int(nmId) if nmId is not None else 0, str(barcode or ""), str(techSize or ""))
+            add_to_sum(key, quantity, inWayToClient, inWayFromClient, quantityFull)
+
+    # агрегатные строки
+    for (nmId, barcode, techSize), s in sums.items():
+        out.append({
+            "updated_utc": now_utc,
+            "last_change_date": None,
+
+            "warehouse_name": "Всего находится на складах",
+            "supplier_article": None,  # не всегда однозначный (можно опционально вычислить)
+            "nm_id": nmId,
+            "barcode": barcode,
+            "tech_size": techSize,
+
+            "quantity": s["q"],
+            "in_way_to_client": s["to"],
+            "in_way_from_client": s["from"],
+            "quantity_full": s["full"],
+
+            "category": None,
+            "subject_name": None,
+            "brand": None,
+
+            "price": None,
+            "discount_api": None,
+            "source": "statistics_api_v1_aggregate",
+        })
+
+    print(f"Prepared rows (with aggregate): {len(out)}")
+    return out
+
+def inject_discounts(rows: List[Dict[str, Any]], bearer: str) -> None:
+    """
+    Дополняем скидку из Discounts API: кладём в поле discount_pct (0..1).
+    """
+    disc_map = fetch_discounts_map(bearer)
+    hit = 0
+    for r in rows:
+        nm = r.get("nm_id")
+        if isinstance(nm, int) and nm in disc_map:
+            r["discount_pct"] = disc_map[nm]
+            hit += 1
+    print(f"Discounts matched rows: {hit}")
+
+# -------------------- main --------------------
 
 def main():
-    wb_api_key = env_required("WB_API_KEY")  # токен категории "Аналитика продавца" (НЕ Bearer!)
     sb = supabase_client()
 
-    # 1) создаём задачу (GET сначала)
-    task_id = create_report_task(wb_api_key)
+    stats_key = env_required("WB_STATS_API_KEY")
+    discounts_bearer = os.getenv("WB_DISCOUNTS_BEARER", "").strip()
 
-    # 2) ждём готовности
-    wait_report_ready(wb_api_key, task_id)
+    print("Fetching WB stocks (statistics-api)…")
+    raw = fetch_stocks(stats_key)
 
-    # 3) скачиваем
-    report_rows = download_report(wb_api_key, task_id)
+    print("Transforming…")
+    rows = split_rows_and_aggregate(raw)
 
-    # 4) плющим
-    rows = flatten_rows(report_rows)
+    if WITH_DISCOUNTS:
+        if not discounts_bearer:
+            print("WITH_DISCOUNTS=true, но WB_DISCOUNTS_BEARER не задан — пропускаю подтяжку скидок.")
+        else:
+            print("Fetching discounts…")
+            inject_discounts(rows, discounts_bearer)
 
-    # 5) апсерт
+    print("Upserting to Supabase…")
     upsert_batches(sb, TABLE_NAME, rows, batch_size=BATCH_SIZE)
 
     print(f"Done. Total processed: {len(rows)}")
