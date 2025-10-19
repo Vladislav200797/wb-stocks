@@ -1,19 +1,20 @@
-name: WB Stocks to Supabase
+name: sync
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"  # каждые 30 минут
-  workflow_dispatch: {}      # запуск вручную
+    - cron: "15 5 * * *"   # ежедневно 05:15 UTC
 
 jobs:
-  sync:
+  run:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    permissions:
+      contents: read
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -22,11 +23,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run incremental sync (last 31 minutes)
+      - name: Run stocks_sync
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
-          WB_API_KEY: ${{ secrets.WB_API_KEY }}
-          FULL_SYNC: "0"
+          WB_STATS_API_KEY: ${{ secrets.WB_STATS_API_KEY }}
+          # Включи скидки, если нужно:
+          # WITH_DISCOUNTS: "true"
+          # WB_DISCOUNTS_BEARER: ${{ secrets.WB_DISCOUNTS_BEARER }}
         run: |
           python stocks_sync.py
