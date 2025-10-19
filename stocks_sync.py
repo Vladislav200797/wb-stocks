@@ -80,10 +80,6 @@ def http_request(
     timeout: int = 60,
     retries: int = 1,
 ) -> Response:
-    """
-    Обёртка над requests с лаконичными ретраями (по умолчанию 1 попытка).
-    Под каждую стратегию create_task делаем свой вызов.
-    """
     last_exc: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
@@ -96,7 +92,6 @@ def http_request(
                 timeout=timeout,
             )
             if resp.status_code >= 400:
-                # печатаем небольшой кусок тела для диагностики
                 snippet = resp.text[:300].replace("\n", " ")
                 print(f"{method} {url} -> {resp.status_code}; body~: {snippet}")
             resp.raise_for_status()
@@ -115,44 +110,65 @@ def http_request(
 
 def create_report_task(wb_api_key: str) -> str:
     """
-    Делаем 3 стратегии, т.к. сервер WB может требовать разные формы:
-      S1: POST + query + json={}
-      S2: POST + json={locale, groupBy* as top-level}
-      S3: POST + json={locale, groupBy:{...}} (альтернативная вложенная форма)
+    Порядок стратегий (учитывая ваш лог Allow: GET, HEAD):
+      G1: GET + query
+      P2: POST + query + пустое json {}
+      P3: POST + body с флагами (top-level)
+      P4: POST + body с groupBy объектом
     """
     base_headers = {
-        "Authorization": wb_api_key,        # важно: без "Bearer"
-        "Content-Type": "application/json", # сервер иногда требует явно
+        "Authorization": wb_api_key,        # без "Bearer"
         "Accept": "application/json",
+        "Content-Type": "application/json",
     }
 
-    # ------- Strategy 1: query + пустое тело -------
+    # ------- G1: GET + query (рекомендуемый WB согласно Allow) -------
     params_q = {"locale": REPORT_LOCALE, **REPORT_PARAMS_BOOL}
     params_q = _encode_bool_params(params_q)
-    print("Creating report task (S1: query+empty-json)…")
+    print("Creating report task (G1: GET + query)…")
+    try:
+        resp = http_request(
+            "GET",
+            SELLER_ANALYTICS_BASE,
+            headers=base_headers,
+            params=params_q,
+            retries=1,
+        )
+        data = resp.json()
+        tid = (data.get("data") or {}).get("taskId")
+        if tid:
+            print(f"Report task created (G1): {tid}")
+            return tid
+        else:
+            print(f"G1 returned no taskId, response: {data}")
+    except Exception as e:
+        print(f"G1 failed: {repr(e)}")
+
+    # ------- P2: POST + query + пустое тело -------
+    print("Creating report task (P2: POST + query + empty body)…")
     try:
         resp = http_request(
             "POST",
             SELLER_ANALYTICS_BASE,
             headers=base_headers,
             params=params_q,
-            json_body={},   # пустой JSON — это важно для некоторых гейтов WB
+            json_body={},
             retries=1,
         )
         data = resp.json()
-        tid = data.get("data", {}).get("taskId")
+        tid = (data.get("data") or {}).get("taskId")
         if tid:
-            print(f"Report task created (S1): {tid}")
+            print(f"Report task created (P2): {tid}")
             return tid
         else:
-            print(f"S1 returned no taskId, response: {data}")
+            print(f"P2 returned no taskId, response: {data}")
     except Exception as e:
-        print(f"S1 failed: {repr(e)}")
+        print(f"P2 failed: {repr(e)}")
 
-    # ------- Strategy 2: JSON top-level flags -------
+    # ------- P3: POST + body (top-level flags) -------
     body_top = {"locale": REPORT_LOCALE}
     body_top.update(REPORT_PARAMS_BOOL)
-    print("Creating report task (S2: body with top-level flags)…")
+    print("Creating report task (P3: POST body top-level)…")
     try:
         resp = http_request(
             "POST",
@@ -162,31 +178,28 @@ def create_report_task(wb_api_key: str) -> str:
             retries=1,
         )
         data = resp.json()
-        tid = data.get("data", {}).get("taskId")
+        tid = (data.get("data") or {}).get("taskId")
         if tid:
-            print(f"Report task created (S2): {tid}")
+            print(f"Report task created (P3): {tid}")
             return tid
         else:
-            print(f"S2 returned no taskId, response: {data}")
+            print(f"P3 returned no taskId, response: {data}")
     except Exception as e:
-        print(f"S2 failed: {repr(e)}")
+        print(f"P3 failed: {repr(e)}")
 
-    # ------- Strategy 3: JSON с groupBy объектом -------
-    # Пробуем переложить флаги в объект groupBy — встречается в альтернативной спеки
+    # ------- P4: POST + body (groupBy object) -------
     body_group = {
         "locale": REPORT_LOCALE,
         "groupBy": {
-            # проецируем семантику:
             "brand": REPORT_PARAMS_BOOL["groupByBrand"],
             "subject": REPORT_PARAMS_BOOL["groupBySubject"],
             "sa": REPORT_PARAMS_BOOL["groupBySa"],
             "nm": REPORT_PARAMS_BOOL["groupByNm"],
             "barcode": REPORT_PARAMS_BOOL["groupByBarcode"],
             "size": REPORT_PARAMS_BOOL["groupBySize"],
-        },
-        # без фильтра (можно добавить, если понадобится)
+        }
     }
-    print("Creating report task (S3: body with groupBy object)…")
+    print("Creating report task (P4: POST body groupBy)…")
     try:
         resp = http_request(
             "POST",
@@ -196,16 +209,16 @@ def create_report_task(wb_api_key: str) -> str:
             retries=1,
         )
         data = resp.json()
-        tid = data.get("data", {}).get("taskId")
+        tid = (data.get("data") or {}).get("taskId")
         if tid:
-            print(f"Report task created (S3): {tid}")
+            print(f"Report task created (P4): {tid}")
             return tid
         else:
-            print(f"S3 returned no taskId, response: {data}")
+            print(f"P4 returned no taskId, response: {data}")
     except Exception as e:
-        print(f"S3 failed: {repr(e)}")
+        print(f"P4 failed: {repr(e)}")
 
-    raise RuntimeError("Failed to create report task via all strategies (S1/S2/S3).")
+    raise RuntimeError("Failed to create report task via all strategies (G1/P2/P3/P4).")
 
 def wait_report_ready(wb_api_key: str, task_id: str) -> None:
     headers = {"Authorization": wb_api_key, "Accept": "application/json"}
@@ -216,7 +229,7 @@ def wait_report_ready(wb_api_key: str, task_id: str) -> None:
     while True:
         resp = http_request("GET", status_url, headers=headers)
         data = resp.json()
-        status = data.get("data", {}).get("status")
+        status = (data.get("data") or {}).get("status")
         print(f"task {task_id} status: {status}")
         if status == "done":
             return
@@ -276,6 +289,7 @@ def flatten_rows(report_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 q_full = quantity + in_way_to + in_way_from
             q_full = int(q_full or 0)
 
+            # исключаем "В пути…" из агрегата
             if not warehouse_name.startswith("В пути"):
                 qty_sum += quantity
                 in_way_to_sum += in_way_to
@@ -359,7 +373,7 @@ def main():
     wb_api_key = env_required("WB_API_KEY")  # токен категории "Аналитика продавца" (НЕ Bearer!)
     sb = supabase_client()
 
-    # 1) создаём задачу (с тройным фолбэком)
+    # 1) создаём задачу (GET сначала)
     task_id = create_report_task(wb_api_key)
 
     # 2) ждём готовности
