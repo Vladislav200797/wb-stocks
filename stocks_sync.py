@@ -3,35 +3,34 @@
 
 """
 Синхронизация остатков WB в Supabase через отчёт Seller Analytics:
-- Создаём задачу на отчёт /api/v1/warehouse_remains
-- Пулим статус, дожидаемся "done"
+- Создаём задачу /api/v1/warehouse_remains
+- Ждём статуса "done"
 - Скачиваем отчёт
-- "Плющим" склады в строки (по складу/штрихкоду/размеру и т.п.)
+- Плющим по складам + добавляем агрегат "Всего находится на складах"
 - Апсертим батчами в таблицу stocks_current
 
-Переменные окружения (GitHub Actions -> Secrets):
+ENV (GitHub Actions -> Secrets):
   SUPABASE_URL
   SUPABASE_SERVICE_ROLE
-  WB_API_KEY  (токен категории "Аналитика продавца" / Seller Analytics)
+  WB_API_KEY              # токен категории "Аналитика продавца" (без Bearer!)
 Опционально:
-  TABLE_NAME (по умолчанию stocks_current)
-  BATCH_SIZE (по умолчанию 1000)
+  TABLE_NAME   (default: stocks_current)
+  BATCH_SIZE   (default: 1000)
 """
 
 from __future__ import annotations
-
 import os
 import sys
 import time
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 from requests import Response
 from supabase import create_client, Client
 
 # --------------------
-# Константы / настройки
+# Конфиг
 # --------------------
 
 SELLER_ANALYTICS_BASE = "https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains"
@@ -39,7 +38,6 @@ SELLER_ANALYTICS_BASE = "https://seller-analytics-api.wildberries.ru/api/v1/ware
 TABLE_NAME = os.getenv("TABLE_NAME", "stocks_current")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
 
-# Группировки — включаем всё, чтобы получить максимум деталей (бренд/предмет/артикулы/баркоды/размеры/объём)
 REPORT_PARAMS_BOOL = {
     "groupByBrand": False,
     "groupBySubject": False,
@@ -48,10 +46,10 @@ REPORT_PARAMS_BOOL = {
     "groupByBarcode": True,
     "groupBySize": True,
 }
-REPORT_LOCALE = "ru"  # ru|en|zh
+REPORT_LOCALE = "ru"
 
 POLL_INTERVAL_SEC = 2
-POLL_TIMEOUT_SEC = 180  # запас по времени ожидания готовности отчёта
+POLL_TIMEOUT_SEC = 180
 
 # --------------------
 # Утилиты
@@ -64,6 +62,15 @@ def env_required(name: str) -> str:
         sys.exit(2)
     return val
 
+def _encode_bool_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in params.items():
+        if isinstance(v, bool):
+            out[k] = "true" if v else "false"
+        else:
+            out[k] = v
+    return out
+
 def http_request(
     method: str,
     url: str,
@@ -71,12 +78,13 @@ def http_request(
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
     timeout: int = 60,
-    retries: int = 3,
-    backoff_base: int = 2,
+    retries: int = 1,
 ) -> Response:
     """
-    Обёртка над requests с простыми ретраями.
+    Обёртка над requests с лаконичными ретраями (по умолчанию 1 попытка).
+    Под каждую стратегию create_task делаем свой вызов.
     """
+    last_exc: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
             resp = requests.request(
@@ -87,52 +95,120 @@ def http_request(
                 json=json_body,
                 timeout=timeout,
             )
+            if resp.status_code >= 400:
+                # печатаем небольшой кусок тела для диагностики
+                snippet = resp.text[:300].replace("\n", " ")
+                print(f"{method} {url} -> {resp.status_code}; body~: {snippet}")
             resp.raise_for_status()
             return resp
         except requests.HTTPError as e:
+            last_exc = e
             if attempt < retries:
-                wait = backoff_base ** attempt
-                print(f"{method} {url} error: {repr(e)}, retry in {wait}s (attempt {attempt}/{retries})")
-                time.sleep(wait)
-                continue
-            print(
-                f"HTTP failed after retries: {method} {url} last_err={repr(e)}",
-                file=sys.stderr,
-            )
-            raise
-
-def _encode_bool_params(params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    В query у WB нужно строго 'true'/'false' в нижнем регистре.
-    """
-    out: Dict[str, Any] = {}
-    for k, v in params.items():
-        if isinstance(v, bool):
-            out[k] = "true" if v else "false"
-        else:
-            out[k] = v
-    return out
+                time.sleep(1.5)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("http_request failed without exception?")
 
 # --------------------
-# WB Seller Analytics: создание/ожидание/загрузка отчёта
+# WB Seller Analytics: создание/ожидание/скачивание
 # --------------------
 
 def create_report_task(wb_api_key: str) -> str:
-    headers = {"Authorization": wb_api_key}
-    params = {"locale": REPORT_LOCALE, **REPORT_PARAMS_BOOL}
-    params = _encode_bool_params(params)
+    """
+    Делаем 3 стратегии, т.к. сервер WB может требовать разные формы:
+      S1: POST + query + json={}
+      S2: POST + json={locale, groupBy* as top-level}
+      S3: POST + json={locale, groupBy:{...}} (альтернативная вложенная форма)
+    """
+    base_headers = {
+        "Authorization": wb_api_key,        # важно: без "Bearer"
+        "Content-Type": "application/json", # сервер иногда требует явно
+        "Accept": "application/json",
+    }
 
-    print("Creating report task…")
-    resp = http_request("POST", SELLER_ANALYTICS_BASE, headers=headers, params=params)
-    data = resp.json()
-    task_id = data.get("data", {}).get("taskId")
-    if not task_id:
-        raise RuntimeError(f"WB create task: unexpected response: {data}")
-    print(f"Report task created: {task_id}")
-    return task_id
+    # ------- Strategy 1: query + пустое тело -------
+    params_q = {"locale": REPORT_LOCALE, **REPORT_PARAMS_BOOL}
+    params_q = _encode_bool_params(params_q)
+    print("Creating report task (S1: query+empty-json)…")
+    try:
+        resp = http_request(
+            "POST",
+            SELLER_ANALYTICS_BASE,
+            headers=base_headers,
+            params=params_q,
+            json_body={},   # пустой JSON — это важно для некоторых гейтов WB
+            retries=1,
+        )
+        data = resp.json()
+        tid = data.get("data", {}).get("taskId")
+        if tid:
+            print(f"Report task created (S1): {tid}")
+            return tid
+        else:
+            print(f"S1 returned no taskId, response: {data}")
+    except Exception as e:
+        print(f"S1 failed: {repr(e)}")
+
+    # ------- Strategy 2: JSON top-level flags -------
+    body_top = {"locale": REPORT_LOCALE}
+    body_top.update(REPORT_PARAMS_BOOL)
+    print("Creating report task (S2: body with top-level flags)…")
+    try:
+        resp = http_request(
+            "POST",
+            SELLER_ANALYTICS_BASE,
+            headers=base_headers,
+            json_body=body_top,
+            retries=1,
+        )
+        data = resp.json()
+        tid = data.get("data", {}).get("taskId")
+        if tid:
+            print(f"Report task created (S2): {tid}")
+            return tid
+        else:
+            print(f"S2 returned no taskId, response: {data}")
+    except Exception as e:
+        print(f"S2 failed: {repr(e)}")
+
+    # ------- Strategy 3: JSON с groupBy объектом -------
+    # Пробуем переложить флаги в объект groupBy — встречается в альтернативной спеки
+    body_group = {
+        "locale": REPORT_LOCALE,
+        "groupBy": {
+            # проецируем семантику:
+            "brand": REPORT_PARAMS_BOOL["groupByBrand"],
+            "subject": REPORT_PARAMS_BOOL["groupBySubject"],
+            "sa": REPORT_PARAMS_BOOL["groupBySa"],
+            "nm": REPORT_PARAMS_BOOL["groupByNm"],
+            "barcode": REPORT_PARAMS_BOOL["groupByBarcode"],
+            "size": REPORT_PARAMS_BOOL["groupBySize"],
+        },
+        # без фильтра (можно добавить, если понадобится)
+    }
+    print("Creating report task (S3: body with groupBy object)…")
+    try:
+        resp = http_request(
+            "POST",
+            SELLER_ANALYTICS_BASE,
+            headers=base_headers,
+            json_body=body_group,
+            retries=1,
+        )
+        data = resp.json()
+        tid = data.get("data", {}).get("taskId")
+        if tid:
+            print(f"Report task created (S3): {tid}")
+            return tid
+        else:
+            print(f"S3 returned no taskId, response: {data}")
+    except Exception as e:
+        print(f"S3 failed: {repr(e)}")
+
+    raise RuntimeError("Failed to create report task via all strategies (S1/S2/S3).")
 
 def wait_report_ready(wb_api_key: str, task_id: str) -> None:
-    headers = {"Authorization": wb_api_key}
+    headers = {"Authorization": wb_api_key, "Accept": "application/json"}
     status_url = f"{SELLER_ANALYTICS_BASE}/tasks/{task_id}/status"
 
     print("Waiting for report to be ready…")
@@ -151,11 +227,10 @@ def wait_report_ready(wb_api_key: str, task_id: str) -> None:
         time.sleep(POLL_INTERVAL_SEC)
 
 def download_report(wb_api_key: str, task_id: str) -> List[Dict[str, Any]]:
-    headers = {"Authorization": wb_api_key}
+    headers = {"Authorization": wb_api_key, "Accept": "application/json"}
     download_url = f"{SELLER_ANALYTICS_BASE}/tasks/{task_id}/download"
     print("Downloading report…")
     resp = http_request("GET", download_url, headers=headers)
-    # Ответ — JSON-массив карточек с полем warehouses, если quantity>0
     try:
         data = resp.json()
     except json.JSONDecodeError:
@@ -166,23 +241,12 @@ def download_report(wb_api_key: str, task_id: str) -> List[Dict[str, Any]]:
     return data
 
 # --------------------
-# Трансформация отчёта в строки для БД
+# Трансформация отчёта -> строки БД
 # --------------------
 
 def flatten_rows(report_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Превращаем структуру:
-      [{ brand, subjectName, vendorCode, nmId, barcode, techSize, volume, warehouses: [...]}, ...]
-    в плоские строки по каждому складу (если warehouses есть и quantity>0), при этом
-    добавляем агрегаты:
-      - quantity_total_on_warehouses: сумма quantity по складам (что фактически и есть "Всего находится на складах")
-      - in_way_to_client_total
-      - in_way_from_client_total
-      - quantity_full_total (если WB вернёт; если нет — считаем quantity + inWayToClient + inWayFromClient)
-    Также добавляем 2 "агрегатные" строки с warehouse_name = "Всего находится на складах"
-    (и отдельные суммы по in_way*) — чтобы быстро сравнивать.
-    """
     flat: List[Dict[str, Any]] = []
+    now_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     for row in report_rows:
         brand = row.get("brand")
@@ -194,29 +258,24 @@ def flatten_rows(report_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         volume = row.get("volume")
         warehouses = row.get("warehouses") or []
 
-        # сумма по складам только по реальным складам (без "в пути")
         qty_sum = 0
         in_way_to_sum = 0
         in_way_from_sum = 0
         qty_full_sum = 0
 
-        # сначала разворачиваем реальные склады
         for w in warehouses:
             warehouse_id = w.get("warehouseId")
-            warehouse_name = w.get("warehouseName") or ""
-            # WB обычно кладёт поля:
+            warehouse_name = (w.get("warehouseName") or "").strip()
+
             quantity = int(w.get("quantity") or 0)
             in_way_to = int(w.get("inWayToClient") or 0)
             in_way_from = int(w.get("inWayFromClient") or 0)
 
-            # quantityFull бывает на карточке, но иногда отдают только на складском уровне — учитываем оба случая
             q_full = w.get("quantityFull")
             if q_full is None:
-                # если нет — посчитаем сами как quantity + в пути (как в ЛК)
                 q_full = quantity + in_way_to + in_way_from
             q_full = int(q_full or 0)
 
-            # Реальные склады — это не "в пути…"
             if not warehouse_name.startswith("В пути"):
                 qty_sum += quantity
                 in_way_to_sum += in_way_to
@@ -238,15 +297,12 @@ def flatten_rows(report_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "in_way_to_client": in_way_to,
                     "in_way_from_client": in_way_from,
                     "quantity_full": q_full,
-                    # служебные
                     "source": "seller_analytics_warehouse_remains",
                     "locale": REPORT_LOCALE,
-                    "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "updated_utc": now_utc,
                 }
             )
 
-        # агрегатная строка "Всего находится на складах" (по реальным складам)
-        # чтобы легко сравнивать с числом из ЛК
         flat.append(
             {
                 "nm_id": nm_id,
@@ -261,11 +317,10 @@ def flatten_rows(report_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "quantity": qty_sum,
                 "in_way_to_client": in_way_to_sum,
                 "in_way_from_client": in_way_from_sum,
-                # quantity_full для total считаем так же, как сумма по складам
                 "quantity_full": qty_full_sum if qty_full_sum else (qty_sum + in_way_to_sum + in_way_from_sum),
                 "source": "seller_analytics_warehouse_remains",
                 "locale": REPORT_LOCALE,
-                "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "updated_utc": now_utc,
             }
         )
 
@@ -273,7 +328,7 @@ def flatten_rows(report_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return flat
 
 # --------------------
-# Запись в Supabase
+# Supabase
 # --------------------
 
 def supabase_client() -> Client:
@@ -286,13 +341,13 @@ def upsert_batches(sb: Client, table: str, rows: List[Dict[str, Any]], batch_siz
     if total == 0:
         print("Nothing to upsert.")
         return
-
-    # Индекс/ключ для upsert — на текущие остатки логично взять (nm_id, barcode, tech_size, warehouse_name)
-    # warehouse_id иногда None у агрегатной строки — тогда ключом будет warehouse_name (тоже уникально).
-    # Создайте в таблице соответствующий UNIQUE индекс.
     for i in range(0, total, batch_size):
         chunk = rows[i : i + batch_size]
-        res = sb.table(table).upsert(chunk, ignore_duplicates=False, on_conflict="nm_id,barcode,tech_size,warehouse_name").execute()
+        res = sb.table(table).upsert(
+            chunk,
+            ignore_duplicates=False,
+            on_conflict="nm_id,barcode,tech_size,warehouse_name",
+        ).execute()
         affected = getattr(res, "count", None) or len(chunk)
         print(f"Upserted batch {len(chunk)} (affected≈{affected}), progress {min(i+batch_size, total)}/{total}")
 
@@ -301,22 +356,22 @@ def upsert_batches(sb: Client, table: str, rows: List[Dict[str, Any]], batch_siz
 # --------------------
 
 def main():
-    wb_api_key = env_required("WB_API_KEY")  # токен категории "Аналитика продавца"
+    wb_api_key = env_required("WB_API_KEY")  # токен категории "Аналитика продавца" (НЕ Bearer!)
     sb = supabase_client()
 
-    # 1) создать задачу
+    # 1) создаём задачу (с тройным фолбэком)
     task_id = create_report_task(wb_api_key)
 
-    # 2) дождаться готовности
+    # 2) ждём готовности
     wait_report_ready(wb_api_key, task_id)
 
-    # 3) скачать
+    # 3) скачиваем
     report_rows = download_report(wb_api_key, task_id)
 
-    # 4) плоские строки
+    # 4) плющим
     rows = flatten_rows(report_rows)
 
-    # 5) апсерты в таблицу
+    # 5) апсерт
     upsert_batches(sb, TABLE_NAME, rows, batch_size=BATCH_SIZE)
 
     print(f"Done. Total processed: {len(rows)}")
